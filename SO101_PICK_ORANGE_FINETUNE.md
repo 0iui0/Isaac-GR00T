@@ -122,6 +122,8 @@ export CUDA_VISIBLE_DEVICES=0,1
 
 ## 步骤 4：执行微调
 
+### 单卡训练 (RTX 5090 32GB)
+
 ```bash
 export HF_HOME=<your_hf_cache_path>
 CUDA_VISIBLE_DEVICES=0 \
@@ -145,12 +147,46 @@ CUDA_VISIBLE_DEVICES=0 \
     --shard-size 1024 \
     --num-shards-per-epoch 100000 \
     --episode-sampling-rate 0.1 \
-    --use-wandb true \
+    --use-wandb \
     --wandb-project so101_pick_orange
 ```
 
+### 双卡训练 (2× RTX 5090, DeepSpeed ZeRO-2)
+
+```bash
+export HF_HOME=<your_hf_cache_path>
+export CUDA_VISIBLE_DEVICES=0,1
+export https_proxy=http://your_proxy # wandb 国内代理
+
+.venv/bin/python gr00t/experiment/launch_finetune.py \
+    --base-model-path $HF_HOME/nv-community/GR00T-N1.7-3B \
+    --dataset-path /datasets/so101_pick_orange_lerobot \
+    --modality-config-path examples/SO101_pick_orange/so101_config.py \
+    --embodiment-tag NEW_EMBODIMENT \
+    --output-dir /datasets/so101_pick_orange_finetune_2gpu \
+    --max-steps 2000 \
+    --save-steps 500 \
+    --save-total-limit 5 \
+    --warmup-ratio 0.05 \
+    --weight-decay 1e-5 \
+    --learning-rate 1e-4 \
+    --global-batch-size 4 \
+    --gradient-accumulation-steps 4 \
+    --num-gpus 2 \
+    --color-jitter-params brightness 0.3 contrast 0.4 saturation 0.5 hue 0.08 \
+    --dataloader-num-workers 2 \
+    --shard-size 1024 \
+    --num-shards-per-epoch 100000 \
+    --episode-sampling-rate 0.1 \
+    --use-wandb \
+    --wandb-project so101_pick_orange
+```
+
+> 单卡 vs 双卡区别：`CUDA_VISIBLE_DEVICES`、`--num-gpus`、`--output-dir` 不同，超参一致方便对比。
+> 双卡使用 DeepSpeed ZeRO-2 自动分片优化器状态，有效 batch size 相同 (4/2×4=16 vs 4/1×4=16)。
+
 > 首次使用 wandb 需要先登录：`wandb login`（API key: https://wandb.ai/authorize）。
-> 如果 OOM，将 `CUDA_VISIBLE_DEVICES=0` 改为 `CUDA_VISIBLE_DEVICES=0,1`，`--num-gpus 1` 改为 `--num-gpus 2`。
+> 查看 TensorBoard：`tensorboard --logdir /datasets/so101_pick_orange_finetune_2gpu`。
 
 ## 步骤 5：启动推理服务器
 
