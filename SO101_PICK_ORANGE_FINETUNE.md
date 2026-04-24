@@ -24,8 +24,9 @@ export CUDA_VISIBLE_DEVICES=0         # 或 0,1 使用多卡
 | `gr00t/experiment/launch_finetune.py` | 使用 `$HF_HOME` 环境变量定位 backbone | 去掉硬编码路径 |
 | `gr00t/experiment/launch_finetune.py` | 添加 gradient checkpointing + 冻结 VLLN/projector | 降低显存需求 |
 | `gr00t/experiment/experiment.py` | `report_to` 改为同时记录 tensorboard 和 wandb | 实验可视化 |
-| `gr00t/eval/run_gr00t_server.py` | （已回退 default_language，由客户端传递） | 客户端通过 `--policy_language_instruction` 传 |
 | leisaac `policy/base.py` | `call_endpoint` 增加 error dict 检查 | 服务器错误时不再 KeyError |
+| leisaac `service_policy_clients.py` | 新增 `Gr00t17ServicePolicyClient` | N1.7 训练数据是弧度，不做电机角度转换 |
+| leisaac `policy_inference.py` | 新增 `gr00tn1.7` policy_type | 使用独立的 N1.7 客户端 |
 
 ### 3. 基础模型下载 (已完成)
 - GR00T-N1.7-3B: `$HF_HOME/nv-community/GR00T-N1.7-3B/`
@@ -176,7 +177,7 @@ cd /workspace/isaaclab/isaac-lab-scripts/leisaac
 python scripts/evaluation/policy_inference.py \
     --task=LeIsaac-SO101-PickOrange-v0 \
     --eval_rounds=10 \
-    --policy_type=gr00tn1.5 \
+    --policy_type=gr00tn1.7 \
     --policy_host=localhost \
     --policy_port=5555 \
     --policy_timeout_ms=5000 \
@@ -188,6 +189,38 @@ python scripts/evaluation/policy_inference.py \
 
 > 注意：容器使用 host 网络，`localhost:5555` 直接访问主机的推理服务器。
 > `--policy_language_instruction` 将任务描述传递给策略客户端。
+> `--policy_type=gr00tn1.7` 使用独立的 N1.7 客户端，直接以弧度与模型交互，不经过电机角度转换。
+
+## Action 空间说明
+
+SO101 在 GR00T N1.7 中的 action 表示：
+
+```
+single_arm: RELATIVE + NON_EEF  → delta joint positions (弧度)
+gripper:    ABSOLUTE + NON_EEF   → 绝对 gripper 位置 (弧度)
+```
+
+### 训练时 action 流转
+
+```
+HDF5 (弧度绝对值)
+  → compute delta: action_relative = action_absolute - state (弧度)
+  → normalize to [-1, 1] (用 stats.json 的 mean/std)
+  → 模型学习归一化 delta
+```
+
+### 推理时 action 流转
+
+```
+服务器 decode_action:
+  模型输出 → unnormalize (弧度 delta) → + current_state → 弧度绝对值
+客户端:
+  N1.7 客户端 (gr00tn1.7): 收到弧度绝对值 → 直接发给仿真
+  N1.6 客户端 (gr00tn1.6): 收到弧度绝对值 → 电机角度转换后发给仿真 (用于 LeRobot 原生数据)
+```
+
+> **关键**: 训练数据来源 (`obs/joint_pos`) 是 leisaac 内部的**弧度**表示。
+> 如果数据来源是 LeRobot 原生数据集（电机角度空间），则使用 `--policy_type=gr00tn1.6`。
 
 ---
 
@@ -226,3 +259,4 @@ python scripts/evaluation/policy_inference.py \
 | language 为 None | 仿真不发 task description，服务器 `check_observation` 断言失败 | 客户端通过 `--policy_language_instruction` 传 |
 | 服务器错误 → KeyError: 0 | 服务器返回 `{"error": "..."}` dict，leisaac 客户端 `call_endpoint` 未检查 error | `base.py` 增加 error dict 检查 |
 | 端口占用 | 旧服务器未关，新实例 `Address already in use` | 先 kill 旧进程 |
+| **action 空间不匹配** | 训练数据弧度，客户端转成电机角度发给模型，数值差 50~100 倍，机械臂抖动 | 新建 `Gr00t17ServicePolicyClient`，用 `--policy_type=gr00tn1.7` |
