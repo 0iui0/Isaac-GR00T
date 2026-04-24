@@ -153,12 +153,18 @@ CUDA_VISIBLE_DEVICES=0 \
 
 ### 双卡训练 (2× RTX 5090, DeepSpeed ZeRO-2)
 
+> **必须用 `torchrun` 启动**，不能直接 `python`。多卡需要分布式初始化，`torchrun` 会自动设置
+> `WORLD_SIZE`、`LOCAL_RANK` 等环境变量并启动多个进程。直接用 `python` 会回退到 DataParallel，
+> 导致 `RuntimeError: module must have its parameters and buffers on device cuda:0 but found
+> one of them on device: cpu`。
+
 ```bash
 export HF_HOME=<your_hf_cache_path>
 export CUDA_VISIBLE_DEVICES=0,1
 export https_proxy=http://your_proxy # wandb 国内代理
 
-.venv/bin/python gr00t/experiment/launch_finetune.py \
+torchrun --nproc_per_node=2 --master_port=29500 \
+    gr00t/experiment/launch_finetune.py \
     --base-model-path $HF_HOME/nv-community/GR00T-N1.7-3B \
     --dataset-path /datasets/so101_pick_orange_lerobot \
     --modality-config-path examples/SO101_pick_orange/so101_config.py \
@@ -182,8 +188,9 @@ export https_proxy=http://your_proxy # wandb 国内代理
     --wandb-project so101_pick_orange
 ```
 
-> 单卡 vs 双卡区别：`CUDA_VISIBLE_DEVICES`、`--num-gpus`、`--output-dir` 不同，超参一致方便对比。
+> 单卡 vs 双卡区别：启动方式（`python` → `torchrun`）、`--num-gpus`、`--output-dir` 不同，超参一致方便对比。
 > 双卡使用 DeepSpeed ZeRO-2 自动分片优化器状态，有效 batch size 相同 (4/2×4=16 vs 4/1×4=16)。
+> 也可以用 `bash examples/finetune.sh` 脚本，它会自动根据 `NUM_GPUS` 选择 `python` 或 `torchrun`。
 
 > 首次使用 wandb 需要先登录：`wandb login`（API key: https://wandb.ai/authorize）。
 > 查看 TensorBoard：`tensorboard --logdir /datasets/so101_pick_orange_finetune_2gpu`。
@@ -287,6 +294,7 @@ HDF5 (弧度绝对值)
 | wandb 401 | .netrc 里旧 key 被撤销 | `wandb login --relogin` |
 | setuptools | v82 删除 `pkg_resources` | `pip install "setuptools<70"` |
 | 显存 OOM | 3B 模型 32GB 不够 | 冻结 VLLN/projector + gradient checkpointing |
+| **双卡用 `python` 启动** | `RuntimeError: module must have its parameters on cuda:0 but found on cpu` | 必须用 `torchrun --nproc_per_node=2` 启动，不能用 `python` 直接跑。`python` 缺少分布式初始化，Trainer 回退到 DataParallel，部分冻结参数仍在 CPU 导致报错 |
 
 ### 推理阶段
 
