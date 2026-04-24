@@ -8,6 +8,12 @@
 /examples/LIBERO/libero_object_no_noops_1.0.0_lerobot/
 /examples/LIBERO/libero_spatial_no_noops_1.0.0_lerobot/
 
+# Generated modality configs (from conversion scripts)
+**/modality.json
+
+# External dependencies (not part of this repo)
+/external_dependencies/
+
 # UV lock file
 uv.lock
 
