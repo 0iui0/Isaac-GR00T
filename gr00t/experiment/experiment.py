@@ -227,7 +227,7 @@ def run(config: Config):
         gradient_checkpointing=config.training.gradient_checkpointing,
         optim=config.training.optim,
         dataloader_num_workers=config.training.dataloader_num_workers,
-        report_to="wandb" if config.training.use_wandb else "none",
+        report_to=["tensorboard", "wandb"] if config.training.use_wandb else ["tensorboard"],
         seed=config.data.seed,
         deepspeed=deepspeed_config,
         ddp_find_unused_parameters=False,

@@ -87,9 +87,17 @@ if __name__ == "__main__":
 
     config.model.load_bf16 = False
     config.model.reproject_vision = False
-    config.model.model_name = "nvidia/Cosmos-Reason2-2B"
+    hf_home = os.environ.get("HF_HOME", os.path.expanduser("~/.cache/huggingface"))
+    config.model.model_name = os.path.join(hf_home, "Cosmos-Reason2-2B-git")
     config.model.backbone_trainable_params_fp32 = True
     config.model.use_relative_action = True
+
+    # Reduce VRAM usage: freeze VLLN and projector, only tune diffusion model
+    config.model.tune_vlln = False
+    config.model.tune_projector = False
+
+    # Gradient checkpointing to reduce activation memory
+    config.training.gradient_checkpointing = True
 
     config.training.experiment_name = ft_config.experiment_name
     config.training.start_from_checkpoint = ft_config.base_model_path

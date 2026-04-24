@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import logging
+import os
 from typing import Any, Tuple
 
 import torch
@@ -462,11 +463,15 @@ class Gr00tN1d7ActionHead(nn.Module):
 
     @property
     def device(self):
-        return next(iter(self.parameters())).device
+        for p in self.parameters():
+            return p.device
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     @property
     def dtype(self):
-        return next(iter(self.parameters())).dtype
+        for p in self.parameters():
+            return p.dtype
+        return torch.float32
 
     def prepare_input(self, batch: dict) -> BatchFeature:
         """Prepare input batch for the action head."""
@@ -474,7 +479,7 @@ class Gr00tN1d7ActionHead(nn.Module):
 
 
 def get_backbone_cls(config: Gr00tN1d7Config):
-    if "nvidia/Cosmos-Reason2" in config.model_name or "Qwen/Qwen3-VL" in config.model_name:
+    if "nvidia/Cosmos-Reason2" in config.model_name or "Qwen/Qwen3-VL" in config.model_name or os.path.isdir(config.model_name):
         # We import here as Qwen3Backbone depends on newer transformers versions than the rest of the code.
         from gr00t.model.modules.qwen3_backbone import Qwen3Backbone
 
@@ -601,11 +606,15 @@ class Gr00tN1d7(PreTrainedModel):
 
     @property
     def device(self):
-        return next(iter(self.parameters())).device
+        for p in self.parameters():
+            return p.device
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     @property
     def dtype(self):
-        return next(iter(self.parameters())).dtype
+        for p in self.parameters():
+            return p.dtype
+        return torch.float32
 
 
 # Register the model with HuggingFace
