@@ -85,11 +85,11 @@ if __name__ == "__main__":
     else:
         config.model.extra_augmentation_config = None
 
-    config.model.load_bf16 = False
+    config.model.load_bf16 = True
     config.model.reproject_vision = False
     hf_home = os.environ.get("HF_HOME", os.path.expanduser("~/.cache/huggingface"))
     config.model.model_name = os.path.join(hf_home, "Cosmos-Reason2-2B-git")
-    config.model.backbone_trainable_params_fp32 = True
+    config.model.backbone_trainable_params_fp32 = False
     config.model.use_relative_action = True
 
     # Reduce VRAM usage: freeze VLLN and projector, only tune diffusion model

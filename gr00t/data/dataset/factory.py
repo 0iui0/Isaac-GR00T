@@ -15,6 +15,7 @@
 
 import numpy as np
 import torch
+from pathlib import Path
 from tqdm import tqdm
 
 from gr00t.configs.base_config import Config
@@ -58,10 +59,22 @@ class DatasetFactory:
                     if torch.distributed.get_rank() == 0:
                         generate_stats(dataset_path)
                         generate_rel_stats(dataset_path, EmbodimentTag(embodiment_tag))
+                    else:
+                        # Wait for rank 0 to finish generating stats by polling
+                        # for the stats_rel.json file (avoids NCCL barrier SIGSEGV)
+                        import time
+
+                        rel_stats_path = Path(dataset_path) / "stats_rel.json"
+                        timeout = 300
+                        start = time.time()
+                        while not rel_stats_path.exists() and time.time() - start < timeout:
+                            time.sleep(1)
+                        if not rel_stats_path.exists():
+                            # stats_rel may not be needed (e.g. no relative actions)
+                            pass
                 else:
                     generate_stats(dataset_path)
                     generate_rel_stats(dataset_path, EmbodimentTag(embodiment_tag))
-                barrier()
                 dataset = ShardedSingleStepDataset(
                     dataset_path=dataset_path,
                     embodiment_tag=EmbodimentTag(embodiment_tag),
