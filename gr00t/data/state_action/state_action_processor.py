@@ -183,6 +183,12 @@ class StateActionProcessor:
                             self.norm_params[embodiment_tag]["action"][key] = nested_dict_to_numpy(
                                 self.statistics[embodiment_tag]["relative_action"][key]
                             )
+                            if action_dim.item() == 0:
+                                # Pure relative actions (e.g. EEF) have empty absolute stats;
+                                # derive dim from the relative-action statistics instead.
+                                action_dim = np.array(
+                                    self.norm_params[embodiment_tag]["action"][key]["min"].shape[-1]
+                                )
                             self.norm_params[embodiment_tag]["action"][key]["dim"] = action_dim
 
     def apply_state(
