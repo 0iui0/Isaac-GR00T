@@ -52,9 +52,9 @@ cr5af_config = {
             "gripper_pos",  # 0.0=close, 1.0=open
         ],
     ),
-    # Action: 40-step prediction horizon at 8Hz control (5 seconds)
+    # Action: 10-step prediction horizon at 8Hz control
     "action": ModalityConfig(
-        delta_indices=list(range(0, 40)),
+        delta_indices=list(range(0, 10)),
         modality_keys=[
             "eef_9d",
             "joint_pos",

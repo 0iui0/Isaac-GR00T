@@ -1,15 +1,9 @@
 #!/usr/bin/env python3
 """Convert CR5AF .npz recordings to LeRobot v2 format for GR00T finetuning.
 
-Task descriptions are read from each episode's meta.json (written by record_demo.py).
-Multiple tasks are automatically detected and assigned unique task_index values.
+Processes episodes one at a time to avoid memory issues.
 
 Usage:
-    # Record episodes separately per task:
-    python record_demo.py --task "抓取电机外壳放到固定工装上" --grasp-pose grasp_housing ...
-    python record_demo.py --task "抓取轴套放到固定工装上" --grasp-pose grasp_shaft ...
-
-    # Convert all at once — tasks are auto-detected:
     python examples/CR5AF/convert_to_lerobot.py \
         --input-dir recordings/cr5af_demos \
         --output-dir datasets/cr5af_pick_place \
@@ -40,97 +34,155 @@ def encode_video_mp4(frames: np.ndarray, output_path: str, fps: int = 30):
 
 
 def compute_actions(states: np.ndarray) -> np.ndarray:
-    """Compute single-step actions from consecutive states.
+    """Compute actions from consecutive states.
 
-    states: (T, 16)  [eef_9d(9), joint_pos(6), gripper_pos(1)]
+    GR00T expects absolute actions (next state), then internally converts
+    to relative during training based on the ActionConfig.
 
-    action[t] = concat[
-        eef[t+1] - eef[t],      # RELATIVE EEF delta (9D)
-        joints[t+1] - joints[t], # RELATIVE joint delta (6D)
-        gripper[t+1],            # ABSOLUTE gripper target (1D)
-    ]
+    action[t] = state[t+1] for t < T-1
+    action[T-1] = state[T-1] (last frame: stay in place)
     """
     T = states.shape[0]
     actions = np.zeros((T, 16), dtype=np.float32)
     for t in range(T - 1):
-        actions[t, 0:9] = states[t + 1, 0:9] - states[t, 0:9]
-        actions[t, 9:15] = states[t + 1, 9:15] - states[t, 9:15]
-        actions[t, 15:16] = states[t + 1, 15:16]
+        actions[t] = states[t + 1]
+    # Last action = no movement (same as last state)
+    actions[T - 1] = states[T - 1]
     return actions
 
 
-def collect_episodes(input_dir: str):
-    """Discover all episode directories from record_demo.py output."""
+def scan_episodes(input_dir: str):
+    """Scan episode directories without loading data. Returns list of (ep_name, meta)."""
     episodes = []
     root = Path(input_dir)
     for ep_dir in sorted(root.glob("episode_*")):
         npz_path = ep_dir / "data.npz"
         meta_path = ep_dir / "meta.json"
         if npz_path.exists():
-            data = dict(np.load(npz_path))
             meta = {}
             if meta_path.exists():
                 with open(meta_path) as f:
                     meta = json.load(f)
-            episodes.append((ep_dir.name, data, meta))
+            episodes.append((ep_dir.name, meta))
     return episodes
+
+
+def streaming_stats():
+    """Accumulate mean/std/min/max/q01/q99 using streaming method."""
+    return {
+        "n": 0,
+        "sum": None,
+        "sum_sq": None,
+        "min": None,
+        "max": None,
+        "chunks_p1": [],
+        "chunks_p99": [],
+    }
+
+
+def push_streaming(acc, chunk):
+    """Push a (N, D) chunk into streaming accumulator."""
+    N = chunk.shape[0]
+    if acc["n"] == 0:
+        acc["sum"] = chunk.sum(axis=0)
+        acc["sum_sq"] = (chunk ** 2).sum(axis=0)
+        acc["min"] = chunk.min(axis=0)
+        acc["max"] = chunk.max(axis=0)
+    else:
+        acc["sum"] += chunk.sum(axis=0)
+        acc["sum_sq"] += (chunk ** 2).sum(axis=0)
+        acc["min"] = np.minimum(acc["min"], chunk.min(axis=0))
+        acc["max"] = np.maximum(acc["max"], chunk.max(axis=0))
+    acc["n"] += N
+    # Keep percentile samples (at most 10000 per chunk for memory)
+    if N > 0:
+        sample_n = min(10000, N)
+        idx = np.random.choice(N, size=sample_n, replace=False)
+        acc["chunks_p1"].append(np.percentile(chunk[idx], 1, axis=0, keepdims=True))
+        acc["chunks_p99"].append(np.percentile(chunk[idx], 99, axis=0, keepdims=True))
+
+
+def freeze_stats(acc):
+    """Produce final stats dict from streaming accumulator."""
+    mean = acc["sum"] / acc["n"]
+    variance = acc["sum_sq"] / acc["n"] - mean ** 2
+    variance = np.clip(variance, 0, None)
+    std = np.sqrt(variance)
+    p1 = np.concatenate(acc["chunks_p1"], axis=0).mean(axis=0)
+    p99 = np.concatenate(acc["chunks_p99"], axis=0).mean(axis=0)
+    return {
+        "mean": mean.tolist(),
+        "std": std.tolist(),
+        "min": acc["min"].tolist(),
+        "max": acc["max"].tolist(),
+        "q01": p1.tolist(),
+        "q99": p99.tolist(),
+    }
 
 
 def convert_dataset(input_dir: str, output_dir: str, fps: int):
     out = Path(output_dir)
+    episodes_meta = scan_episodes(input_dir)
 
-    episodes = collect_episodes(input_dir)
-
-    if not episodes:
+    if not episodes_meta:
         print(f"No episodes found in {input_dir}")
         return
 
-    print(f"Found {len(episodes)} episodes")
+    print(f"Found {len(episodes_meta)} episodes")
 
     # Build task_index mapping from per-episode meta.json
     task_map = {}
-    for _, _, meta in episodes:
+    for _, meta in episodes_meta:
         t = meta.get("task", "unknown task")
         if t not in task_map:
             task_map[t] = len(task_map)
     print(f"Detected {len(task_map)} unique tasks: {task_map}")
 
     chunks_size = 1000
-    episode_meta = []
-    all_states_for_stats = []
-    all_actions_for_stats = []
+    episode_meta_list = []
 
-    # Accumulators for relative_stats
-    eef_rel_chunks = []
-    joint_rel_chunks = []
-    gripper_abs_chunks = []
+    # Streaming accumulators for stats
+    state_acc = streaming_stats()
+    action_acc = streaming_stats()
+    eef_rel_acc = streaming_stats()
+    joint_rel_acc = streaming_stats()
+    gripper_abs_acc = streaming_stats()
 
-    for ep_idx, (ep_name, data, meta) in enumerate(episodes):
+    total_frames = 0
+
+    # Pre-create directories
+    for chunk_idx in range((len(episodes_meta) + chunks_size - 1) // chunks_size):
+        (out / "data" / f"chunk-{chunk_idx:03d}").mkdir(parents=True, exist_ok=True)
+        video_dir = out / "videos" / f"chunk-{chunk_idx:03d}"
+        for cam_key in ["observation.images.hand_view", "observation.images.table_view"]:
+            (video_dir / cam_key).mkdir(parents=True, exist_ok=True)
+
+    for ep_idx, (ep_name, meta) in enumerate(episodes_meta):
+        npz_path = Path(input_dir) / ep_name / "data.npz"
+        print(f"  [{ep_idx+1}/{len(episodes_meta)}] {ep_name}...", end="", flush=True)
+
+        data = dict(np.load(npz_path))
         state = data["state"]  # (T, 16)
         T = state.shape[0]
         if T < 2:
-            print(f"  Skipping {ep_name}: too short ({T} frames)")
+            print(f" SKIP ({T} frames)")
             continue
 
         action = compute_actions(state)
+        task_idx = task_map[meta.get("task", "unknown task")]
 
-        # Collect for full stats
-        all_states_for_stats.append(state[:-1])
-        all_actions_for_stats.append(action[:-1])
+        # Streaming stats (T-1 frames)
+        push_streaming(state_acc, state[:-1])
+        push_streaming(action_acc, action[:-1])
+        push_streaming(eef_rel_acc, np.diff(state[:, 0:9], axis=0))
+        push_streaming(joint_rel_acc, np.diff(state[:, 9:15], axis=0))
+        push_streaming(gripper_abs_acc, state[1:, 15:16])
 
-        # Collect for per-key relative stats
-        eef_rel_chunks.append(np.diff(state[:, 0:9], axis=0))
-        joint_rel_chunks.append(np.diff(state[:, 9:15], axis=0))
-        gripper_abs_chunks.append(state[1:, 15:16])
-
-        # Write per-episode parquet
+        # Write parquet
         chunk_idx = ep_idx // chunks_size
-        parquet_dir = out / "data" / f"chunk-{chunk_idx:03d}"
-        parquet_dir.mkdir(parents=True, exist_ok=True)
-        parquet_path = parquet_dir / f"episode_{ep_idx:06d}.parquet"
+        parquet_path = out / "data" / f"chunk-{chunk_idx:03d}" / f"episode_{ep_idx:06d}.parquet"
 
         rows = []
-        task_idx = task_map[meta.get("task", "unknown task")]
         for t in range(T):
             rows.append({
                 "observation.state": state[t].tolist(),
@@ -148,33 +200,26 @@ def convert_dataset(input_dir: str, output_dir: str, fps: int):
         # Write MP4 videos
         video_dir = out / "videos" / f"chunk-{chunk_idx:03d}"
         video_mapping = {
-            "hand_view": data.get("images_hand"),
-            "table_view": data.get("images_table"),
+            "observation.images.hand_view": data.get("images_hand"),
+            "observation.images.table_view": data.get("images_table"),
         }
 
         for cam_name, frames in video_mapping.items():
             if frames is not None and len(frames) == T:
-                original_key = f"observation.images.{cam_name}"
-                cam_subdir = video_dir / original_key
-                cam_subdir.mkdir(parents=True, exist_ok=True)
-                video_path = cam_subdir / f"episode_{ep_idx:06d}.mp4"
+                video_path = video_dir / cam_name / f"episode_{ep_idx:06d}.mp4"
                 encode_video_mp4(frames, str(video_path), fps)
 
-        episode_meta.append({"episode_index": ep_idx, "length": T})
-        print(f"  {ep_name}: {T} frames")
+        episode_meta_list.append({"episode_index": ep_idx, "length": T})
+        total_frames += T
 
-    if not all_states_for_stats:
+        # Free memory
+        del data, state, action, df, rows
+
+        print(f" {T} frames (task={task_idx})")
+
+    if not episode_meta_list:
         print("No valid episodes to convert.")
         return
-
-    # Collect all state for full stats (not just T-1)
-    all_states_full = np.concatenate(
-        [data["state"] for _, data, _ in episodes if data["state"].shape[0] >= 2], axis=0
-    )
-    all_actions_full = np.concatenate(all_actions_for_stats, axis=0)
-    eef_rel_all = np.concatenate(eef_rel_chunks, axis=0)
-    joint_rel_all = np.concatenate(joint_rel_chunks, axis=0)
-    gripper_abs_all = np.concatenate(gripper_abs_chunks, axis=0)
 
     # ── Write meta files ──
     meta_dir = out / "meta"
@@ -197,15 +242,15 @@ def convert_dataset(input_dir: str, output_dir: str, fps: int):
             "observation.images.hand_view": {"dtype": "video", "shape": [240, 320, 3], "names": None},
             "observation.images.table_view": {"dtype": "video", "shape": [240, 320, 3], "names": None},
         },
-        "total_episodes": len(episode_meta),
-        "total_chunks": (len(episode_meta) + chunks_size - 1) // chunks_size,
+        "total_episodes": len(episode_meta_list),
+        "total_chunks": (len(episode_meta_list) + chunks_size - 1) // chunks_size,
     }
     with open(meta_dir / "info.json", "w") as f:
         json.dump(info, f, indent=2)
 
     # episodes.jsonl
     with open(meta_dir / "episodes.jsonl", "w") as f:
-        for em in episode_meta:
+        for em in episode_meta_list:
             f.write(json.dumps(em) + "\n")
 
     # tasks.jsonl
@@ -230,46 +275,33 @@ def convert_dataset(input_dir: str, output_dir: str, fps: int):
             "table_view": {"original_key": "observation.images.table_view"},
         },
         "annotation": {
-            "human": {
-                "task_description": {"original_key": "annotation.human.task_description"}
-            }
+            "human.task_description": {"original_key": "annotation.human.task_description"}
         },
     }
     with open(meta_dir / "modality.json", "w") as f:
         json.dump(modality, f, indent=2)
 
     # stats.json
-    def stats_dict(arr):
-        return {
-            "mean": arr.mean(axis=0).tolist(),
-            "std": arr.std(axis=0).tolist(),
-            "min": arr.min(axis=0).tolist(),
-            "max": arr.max(axis=0).tolist(),
-            "q01": np.percentile(arr, 1, axis=0).tolist(),
-            "q99": np.percentile(arr, 99, axis=0).tolist(),
-        }
-
     stats = {
-        "observation.state": stats_dict(all_states_full),
-        "action": stats_dict(all_actions_full),
+        "observation.state": freeze_stats(state_acc),
+        "action": freeze_stats(action_acc),
     }
     with open(meta_dir / "stats.json", "w") as f:
         json.dump(stats, f, indent=2)
 
     # relative_stats.json
     relative_stats = {
-        "eef_9d": stats_dict(eef_rel_all),
-        "joint_pos": stats_dict(joint_rel_all),
-        "gripper_pos": stats_dict(gripper_abs_all),
+        "eef_9d": freeze_stats(eef_rel_acc),
+        "joint_pos": freeze_stats(joint_rel_acc),
+        "gripper_pos": freeze_stats(gripper_abs_acc),
     }
     with open(meta_dir / "relative_stats.json", "w") as f:
         json.dump(relative_stats, f, indent=2)
 
     print(f"\nDone! Dataset written to {out}")
-    print(f"  Episodes: {len(episode_meta)}")
-    print(f"  Total frames: {len(all_states_full)}")
-    print(f"  State dim: {all_states_full.shape[1]}")
-    print(f"  Action dim: {all_actions_full.shape[1]}")
+    print(f"  Episodes: {len(episode_meta_list)}")
+    print(f"  Total frames: {total_frames}")
+    print(f"  State dim: {state_acc['sum'].shape[0]}")
 
 
 if __name__ == "__main__":
