@@ -159,8 +159,18 @@ class CR5AFConnection:
                 resp.extend(c)
             return resp.decode().strip()
 
-    def servop(self, x, y, z, rx, ry, rz):
-        cmd = f"ServoP({x:.3f},{y:.3f},{z:.3f},{rx:.3f},{ry:.3f},{rz:.3f})"
+    def enable_impedance(self):
+        """Set low stiffness/damping for smooth ServoP (matching hil-serl cr5af_server)."""
+        with self._cmd_lock:
+            try:
+                self._cmd_sock.sendall(b"FCSetStiffness(100,100,500,50,50,50)")
+                time.sleep(0.05)
+                self._cmd_sock.sendall(b"FCSetDamping(500,500,800,500,500,500)")
+            except Exception:
+                pass
+
+    def servop(self, x, y, z, rx, ry, rz, gain=300):
+        cmd = f"ServoP({x:.3f},{y:.3f},{z:.3f},{rx:.3f},{ry:.3f},{rz:.3f},gain={gain})"
         with self._cmd_lock:
             try:
                 self._cmd_sock.setblocking(False)
@@ -311,6 +321,23 @@ def run_server(model_path: str, port: int, modality_config_path: str = ""):
     )
     print("Model loaded.")
 
+    # Load TensorRT engines for acceleration (if available)
+    trt_engine_path = os.path.join(model_path.rstrip("/"), "trt_engines", "engines")
+    if os.path.isdir(trt_engine_path) and any(f.endswith(".engine") for f in os.listdir(trt_engine_path)):
+        try:
+            repo_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+            if repo_path not in sys.path:
+                sys.path.insert(0, repo_path)
+            from scripts.deployment.trt_model_forward import setup_tensorrt_engines
+            setup_tensorrt_engines(policy, trt_engine_path, mode="n17_full_pipeline")
+            print(f"TRT engines loaded from {trt_engine_path}")
+        except Exception as e:
+            print(f"TRT loading failed (falling back to PyTorch): {e}")
+    else:
+        print(f"No TRT engines found at {trt_engine_path}, using PyTorch")
+
+    # Keep 4 denoising steps for accuracy. TRT single sample + EMA handles smoothness.
+
     ctx = zmq.Context()
     socket = ctx.socket(zmq.REP)
     socket.bind(f"tcp://*:{port}")
@@ -326,7 +353,7 @@ def run_server(model_path: str, port: int, modality_config_path: str = ""):
             obs = request["observation"]
             # Average multiple inferences to reduce diffusion noise
             t0 = time.monotonic()
-            num_samples = 1  # single sample for speed (~200ms); use EMA+deadzone for smoothness
+            num_samples = 2  # TRT双样本~350ms, 精度优先
             actions = []
             for _ in range(num_samples):
                 a, _ = policy.get_action(obs)
@@ -396,6 +423,7 @@ def run_client(server_ip: str, port: int, robot_ip: str,
         print("  EnableRobot:", conn.dashboard_cmd("EnableRobot()"))
         print("  SpeedFactor:", conn.dashboard_cmd(f"SpeedFactor({int(speed)})"))
         conn.dashboard_cmd("ResetRobot()")
+        conn.enable_impedance()
     else:
         print("  DRY-RUN: reading state only, no commands sent")
     time.sleep(0.3)
@@ -554,14 +582,10 @@ def run_client(server_ip: str, port: int, robot_ip: str,
                 k: np.array(v, dtype=np.float32).squeeze(0) for k, v in action.items()
             }
 
-            # Use a later timestep for larger movement delta.
-            # action[0] ≈ state[t+1] (~1mm), action[4] ≈ state[t+5] (~5-10mm)
-            # Use horizon-1 as the target to get meaningful movement per inference.
-            step_idx = min(action_exec_horizon - 1, action_dict["eef_9d"].shape[0] - 1)
-
-            abs_eef = action_dict["eef_9d"][step_idx]       # (9,) absolute target xyz+rot6d
-            abs_joints = action_dict["joint_pos"][step_idx]  # (6,) absolute target joint angles
-            gripper_target = float(action_dict["gripper_pos"][step_idx][0])  # absolute: 0=close, 1=open
+            # Use first timestep (most accurate prediction, closest to current state)
+            abs_eef = action_dict["eef_9d"][0]       # (9,) absolute target xyz+rot6d
+            abs_joints = action_dict["joint_pos"][0]  # (6,) absolute target joint angles
+            gripper_target = float(action_dict["gripper_pos"][0][0])  # absolute: 0=close, 1=open
 
             # Compute deltas from current pose to absolute target
             delta_xyz = abs_eef[:3] - np.array(tv[:3], dtype=np.float32)   # mm
@@ -608,6 +632,11 @@ def run_client(server_ip: str, port: int, robot_ip: str,
 
             if not dry_run:
                 target_x, target_y, target_z = ema_target[0], ema_target[1], ema_target[2]
+                # Dead zone: skip ServoP if delta < 1.5mm to suppress jitter at target
+                delta = np.linalg.norm(np.array([target_x, target_y, target_z]) - np.array(tv[:3]))
+                if delta < 1.5:
+                    time.sleep(dt)
+                    continue
                 # Safety: only enforce workspace limits (not delta limits)
                 if not safety.check_workspace(np.array([target_x, target_y, target_z])):
                     print("\n\nSAFETY: model target outside workspace!")
@@ -846,6 +875,7 @@ def main():
     print("  EnableRobot:", conn.dashboard_cmd("EnableRobot()"))
     print("  SpeedFactor:", conn.dashboard_cmd(f"SpeedFactor({int(args.speed)})"))
     conn.dashboard_cmd("ResetRobot()")
+    conn.enable_impedance()
     time.sleep(0.3)
 
     for _ in range(20):
