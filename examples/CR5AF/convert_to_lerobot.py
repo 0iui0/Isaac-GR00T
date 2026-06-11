@@ -33,21 +33,25 @@ def encode_video_mp4(frames: np.ndarray, output_path: str, fps: int = 30):
     writer.release()
 
 
-def compute_actions(states: np.ndarray) -> np.ndarray:
+def compute_actions(states: np.ndarray, lookahead: int = 1) -> np.ndarray:
     """Compute actions from consecutive states.
 
     GR00T expects absolute actions (next state), then internally converts
     to relative during training based on the ActionConfig.
 
-    action[t] = state[t+1] for t < T-1
-    action[T-1] = state[T-1] (last frame: stay in place)
+    action[t] = state[t+lookahead] for t < T-lookahead
+    action[t] = state[t] for t >= T-lookahead (stay in place)
+
+    Setting lookahead > 1 increases the action delta, giving the model a
+    stronger signal for learning state-conditioned policies.
     """
     T = states.shape[0]
     actions = np.zeros((T, 16), dtype=np.float32)
-    for t in range(T - 1):
-        actions[t] = states[t + 1]
-    # Last action = no movement (same as last state)
-    actions[T - 1] = states[T - 1]
+    for t in range(T - lookahead):
+        actions[t] = states[t + lookahead]
+    # Last lookahead frames: stay in place
+    for t in range(max(0, T - lookahead), T):
+        actions[t] = states[t]
     return actions
 
 
@@ -120,7 +124,7 @@ def freeze_stats(acc):
     }
 
 
-def convert_dataset(input_dir: str, output_dir: str, fps: int):
+def convert_dataset(input_dir: str, output_dir: str, fps: int, lookahead: int = 1):
     out = Path(output_dir)
     episodes_meta = scan_episodes(input_dir)
 
@@ -168,7 +172,7 @@ def convert_dataset(input_dir: str, output_dir: str, fps: int):
             print(f" SKIP ({T} frames)")
             continue
 
-        action = compute_actions(state)
+        action = compute_actions(state, lookahead=lookahead)
         task_idx = task_map[meta.get("task", "unknown task")]
 
         # Streaming stats (T-1 frames)
@@ -311,5 +315,7 @@ if __name__ == "__main__":
     parser.add_argument("--output-dir", required=True,
                         help="LeRobot v2 dataset output directory")
     parser.add_argument("--fps", type=int, default=30)
+    parser.add_argument("--lookahead", type=int, default=1,
+                        help="Action lookahead: action[t]=state[t+lookahead] (default 1)")
     args = parser.parse_args()
-    convert_dataset(args.input_dir, args.output_dir, args.fps)
+    convert_dataset(args.input_dir, args.output_dir, args.fps, lookahead=args.lookahead)

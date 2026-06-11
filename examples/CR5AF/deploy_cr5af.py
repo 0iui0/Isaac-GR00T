@@ -42,7 +42,8 @@ from scipy.spatial.transform import Rotation as R
 # ─── Camera ──────────────────────────────────────────────────────────────────
 
 class RealSenseCamera:
-    def __init__(self, serial_or_index, width=320, height=240, fps=30):
+    def __init__(self, serial_or_index, width=320, height=240, fps=30,
+                 exposure=0, gain=0):
         import pyrealsense2 as rs
         self.pipeline = rs.pipeline()
         config = rs.config()
@@ -51,7 +52,20 @@ class RealSenseCamera:
         else:
             config.enable_device(str(serial_or_index))
         config.enable_stream(rs.stream.color, width, height, rs.format.bgr8, fps)
-        self.pipeline.start(config)
+        profile = self.pipeline.start(config)
+
+        # Set exposure/gain (matching record_demo.py)
+        if exposure > 0 or gain > 0:
+            for sensor in profile.get_device().query_sensors():
+                try:
+                    if exposure > 0:
+                        sensor.set_option(rs.option.enable_auto_exposure, 0)
+                        sensor.set_option(rs.option.exposure, float(exposure))
+                    if gain > 0:
+                        sensor.set_option(rs.option.gain, float(gain))
+                except Exception:
+                    pass
+
         for _ in range(30):
             self.pipeline.wait_for_frames()
 
@@ -110,7 +124,7 @@ class CR5AFConnection:
                         with self._lock:
                             self._joint_pos = list(struct.unpack_from("<6d", data, 192))
                             self._tool_vector = list(struct.unpack_from("<6d", data, RT_TOOL_VECTOR))
-                            self._quaternion = list(struct.unpack_from("<4d", data, 700))
+                            self._quaternion = list(struct.unpack_from("<4d", data, 1384))
                             self._digital_outputs = struct.unpack_from("<Q", data, 24)[0]
             except Exception:
                 if self._running:
@@ -197,9 +211,10 @@ class CR5AFConnection:
 class TopHandCLI:
     def __init__(self, tophand_bin="tophand", hand="right"):
         cmd = [tophand_bin, "-r" if hand == "right" else "-l"]
+        cwd = str(Path(tophand_bin).parent.parent)  # tophand_sdk root
         self.proc = subprocess.Popen(
             cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT, text=True, bufsize=1,
+            stderr=subprocess.STDOUT, text=True, bufsize=1, cwd=cwd,
         )
         self._read_until("[OK] TopHand initialized", timeout=15)
 
@@ -208,7 +223,8 @@ class TopHandCLI:
         while time.time() < deadline:
             line = self.proc.stdout.readline()
             if not line:
-                break
+                time.sleep(0.1)
+                continue
             if expected in line:
                 return line
         return ""
@@ -234,17 +250,35 @@ class TopHandCLI:
 
 # ─── State Conversion ────────────────────────────────────────────────────────
 
-def quat_to_rot6d(q):
-    r = R.from_quat(q)
+def rxyz_to_rot6d(rxyz_deg):
+    """Convert TCP axis-angle [rx, ry, rz] degrees → rotation_6d."""
+    r = R.from_rotvec(rxyz_deg, degrees=True)
     mat = r.as_matrix()
     rot6d = np.concatenate([mat[:, 0], mat[:, 1]])
     return rot6d.astype(np.float32)
 
 
-def build_state_dict(joint_pos, tool_vector, quaternion, gripper_pos):
-    """Build GR00T state dict from CR5AF RT data."""
+def rot6d_to_matrix(rot6d):
+    """Convert 6D rotation representation back to 3x3 rotation matrix."""
+    a1 = rot6d[:3]
+    a2 = rot6d[3:6]
+    # Orthogonalize via Gram-Schmidt
+    b1 = a1 / (np.linalg.norm(a1) + 1e-8)
+    b2 = a2 - np.dot(b1, a2) * b1
+    b2 = b2 / (np.linalg.norm(b2) + 1e-8)
+    b3 = np.cross(b1, b2)
+    return np.stack([b1, b2, b3], axis=-1)
+
+
+def rxyz_to_matrix(rxyz_deg):
+    """Convert TCP axis-angle [rx, ry, rz] degrees → 3x3 rotation matrix."""
+    return R.from_rotvec(rxyz_deg, degrees=True).as_matrix()
+
+
+def build_state_dict(joint_pos, tool_vector, gripper_pos):
+    """Build GR00T state dict from CR5AF RT data. Uses TCP axis-angle directly."""
     eef_xyz = np.array(tool_vector[:3], dtype=np.float32)
-    eef_rot6d = quat_to_rot6d(quaternion)
+    eef_rot6d = rxyz_to_rot6d(tool_vector[3:6])
     eef_9d = np.concatenate([eef_xyz, eef_rot6d])
     return {
         "eef_9d": eef_9d.reshape(1, 1, 9),
@@ -255,11 +289,19 @@ def build_state_dict(joint_pos, tool_vector, quaternion, gripper_pos):
 
 # ─── Inference Server (runs on training machine) ─────────────────────────────
 
-def run_server(model_path: str, port: int):
+def run_server(model_path: str, port: int, modality_config_path: str = ""):
     """ZMQ REP server that accepts observations and returns actions."""
     import zmq
     from gr00t.data.embodiment_tags import EmbodimentTag
     from gr00t.policy.gr00t_policy import Gr00tPolicy
+
+    # Register custom modality config for NEW_EMBODIMENT
+    if modality_config_path:
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("cr5af_config", modality_config_path)
+        cfg = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cfg)
+        print(f"Registered modality config from {modality_config_path}")
 
     print(f"Loading model from {model_path}...")
     policy = Gr00tPolicy(
@@ -282,8 +324,37 @@ def run_server(model_path: str, port: int):
             raw = socket.recv()
             request = msgpack.unpackb(raw)
             obs = request["observation"]
-            action = policy.get_action(obs)
-            socket.send(msgpack.packb(action))
+            # Average multiple inferences to reduce diffusion noise
+            t0 = time.monotonic()
+            num_samples = 1  # single sample for speed (~200ms); use EMA+deadzone for smoothness
+            actions = []
+            for _ in range(num_samples):
+                a, _ = policy.get_action(obs)
+                actions.append({k: np.asarray(v) for k, v in a.items()})
+            # Average across samples
+            action = {}
+            for k in actions[0]:
+                stacked = np.stack([a[k] for a in actions], axis=0)
+                action[k] = stacked.mean(axis=0)
+            dt_infer = time.monotonic() - t0
+            # Debug: print all timesteps for eef_9d to check trajectory
+            print(f"  [infer {dt_infer*1000:.0f}ms, {num_samples} samples]", flush=True)
+            for k, v in action.items():
+                arr = np.asarray(v)
+                if k == "eef_9d" and arr.ndim == 3:
+                    # Print xyz for each timestep
+                    for t in range(arr.shape[1]):
+                        xyz = arr[0, t, :3]
+                        print(f"  [eef_9d] t={t}: xyz=[{xyz[0]:.1f} {xyz[1]:.1f} {xyz[2]:.1f}]", flush=True)
+                else:
+                    flat = arr.flatten()[:min(9, arr.size)]
+                    print(f"  [{k}] shape={arr.shape} first={flat.round(3)}", flush=True)
+            # Convert numpy arrays to lists for msgpack serialization
+            action_serializable = {
+                k: v.tolist() if hasattr(v, 'tolist') else v
+                for k, v in action.items()
+            }
+            socket.send(msgpack.packb(action_serializable))
         except KeyboardInterrupt:
             break
         except Exception as e:
@@ -291,25 +362,311 @@ def run_server(model_path: str, port: int):
             socket.send(msgpack.packb({"error": str(e)}))
 
 
+def run_client(server_ip: str, port: int, robot_ip: str,
+               task: str, grasp_pose: str, tophand_bin: str,
+               tophand_hand: str,
+               hand_exposure: int, hand_gain: int,
+               table_exposure: int, table_gain: int,
+               hz: float, action_exec_horizon: int, speed: float,
+               dry_run: bool, translation_only: bool,
+               max_translation_delta: float, max_rotation_delta: float):
+    """ZMQ REQ client that captures obs, sends to server, executes actions."""
+    import zmq
+    import msgpack
+    import msgpack_numpy
+    msgpack_numpy.patch()
+
+    dt = 1.0 / hz
+
+    # ── Connect to server ──
+    print(f"\n[1/4] Connecting to inference server {server_ip}:{port}...")
+    ctx = zmq.Context()
+    socket = ctx.socket(zmq.REQ)
+    socket.connect(f"tcp://{server_ip}:{port}")
+    socket.setsockopt(zmq.RCVTIMEO, 5000)
+    socket.setsockopt(zmq.SNDTIMEO, 1000)
+    print("  Connected.")
+
+    # ── Connect CR5AF ──
+    # Always connect for state reading; only send commands when not dry-run
+    print(f"\n[2/4] Connecting to CR5AF ({robot_ip})...")
+    conn = CR5AFConnection(robot_ip)
+    conn.connect()
+    if not dry_run:
+        print("  EnableRobot:", conn.dashboard_cmd("EnableRobot()"))
+        print("  SpeedFactor:", conn.dashboard_cmd(f"SpeedFactor({int(speed)})"))
+        conn.dashboard_cmd("ResetRobot()")
+    else:
+        print("  DRY-RUN: reading state only, no commands sent")
+    time.sleep(0.3)
+
+    state = None
+    for _ in range(20):
+        state = conn.get_state()
+        if state:
+            break
+        time.sleep(0.1)
+    if not state:
+        print("ERROR: No RT data from robot.")
+        sys.exit(1)
+    jp, tv, quat, do = state
+    print(f"  TCP: x={tv[0]:.1f} y={tv[1]:.1f} z={tv[2]:.1f}")
+
+    # ── Start TopHand ──
+    hand = None
+    if not dry_run:
+        print(f"\n[3/4] Starting TopHand...")
+        try:
+            hand = TopHandCLI(tophand_bin=tophand_bin, hand=tophand_hand)
+            hand.home()
+            time.sleep(2)
+            hand.grasp(grasp_pose, "pre_grasp")
+            time.sleep(2)
+            print("  TopHand ready.")
+        except Exception as e:
+            print(f"  ERROR: {e}")
+            hand = None
+    else:
+        print("\n[3/4] DRY-RUN: skipping TopHand")
+
+    # ── Start cameras ──
+    print("\n[4/4] Starting cameras...")
+    cam_serial_hand = None
+    cam_serial_table = None
+    try:
+        import pyrealsense2 as rs
+        ctx_rs = rs.context()
+        for dev in ctx_rs.devices:
+            name = dev.get_info(rs.camera_info.name)
+            sn = dev.get_info(rs.camera_info.serial_number)
+            if "455" in name and cam_serial_table is None:
+                cam_serial_table = sn
+            elif "405" in name and cam_serial_hand is None:
+                cam_serial_hand = sn
+        if cam_serial_table and cam_serial_hand:
+            table_cam = RealSenseCamera(cam_serial_table, 640, 480, 30,
+                                            exposure=table_exposure, gain=table_gain)
+            hand_cam = RealSenseCamera(cam_serial_hand, 640, 480, 30,
+                                       exposure=hand_exposure, gain=hand_gain)
+            print(f"  D455 (table): serial={cam_serial_table}")
+            print(f"  D405 (hand):  serial={cam_serial_hand}")
+    except ImportError:
+        print("  pyrealsense2 not available, using OpenCV...")
+        table_cam = cv2.VideoCapture(0)
+        hand_cam = cv2.VideoCapture(1)
+
+    # ── Safety checker ──
+    safety = SafetyChecker(
+        max_translation_delta=max_translation_delta,
+        max_rotation_delta=max_rotation_delta,
+    )
+
+    # ── Inference loop ──
+    print("\n" + "=" * 60)
+    print("READY. Press Ctrl+C to stop.")
+    print("=" * 60)
+
+    # Video history for temporal dimension
+    video_history_hand = deque(maxlen=21)
+    video_history_table = deque(maxlen=21)
+    gripper_state = 1.0  # start open
+    ema_target = None  # EMA-smoothed absolute target for smooth motion
+    action_buffer = np.zeros((0, 16), dtype=np.float32)
+    action_step = 0
+
+    try:
+        while True:
+            loop_start = time.monotonic()
+
+            # Read state
+            state = conn.get_state()
+            if not state:
+                time.sleep(dt)
+                continue
+            jp, tv, quat, do = state
+
+            # Read cameras
+            table_frame = table_cam.read() if isinstance(table_cam, RealSenseCamera) else table_cam.read()[1]
+            hand_frame = hand_cam.read() if isinstance(hand_cam, RealSenseCamera) else hand_cam.read()[1]
+            if table_frame is None or hand_frame is None:
+                time.sleep(dt)
+                continue
+
+            # Resize to 320x240 and store in history
+            table_small = cv2.resize(table_frame, (320, 240))
+            hand_small = cv2.resize(hand_frame, (320, 240))
+            video_history_table.append(table_small)
+            video_history_hand.append(hand_small)
+
+            # Need at least 2 frames for temporal dim
+            if len(video_history_hand) < 2 or len(video_history_table) < 2:
+                time.sleep(dt)
+                continue
+
+            # Build state vector: TCP axis-angle → rot6d (consistent with training data)
+            eef_rot6d = rxyz_to_rot6d(tv[3:6])
+            eef_9d = np.concatenate([np.array(tv[:3], dtype=np.float32), eef_rot6d])
+
+            # Build video: (B=1, T=2, H=240, W=320, C=3) — current + previous frame
+            hand_frames = np.stack([video_history_hand[-2], video_history_hand[-1]], axis=0)
+            table_frames = np.stack([video_history_table[-2], video_history_table[-1]], axis=0)
+
+            # Build observation dict — double expand_dims for (B, T) dims
+            observation = {
+                "video": {
+                    "hand_view": hand_frames[None, ...].astype(np.uint8),    # (1, 2, 240, 320, 3)
+                    "table_view": table_frames[None, ...].astype(np.uint8),  # (1, 2, 240, 320, 3)
+                },
+                "state": {
+                    "eef_9d": eef_9d[None, None, ...],          # (1, 1, 9)
+                    "joint_pos": np.array(jp, dtype=np.float32)[None, None, ...],  # (1, 1, 6)
+                    "gripper_pos": np.array([gripper_state], dtype=np.float32)[None, None, ...],  # (1, 1, 1)
+                },
+                "language": {"annotation.human.task_description": [[task]]},
+            }
+
+            # Send to server, get action
+            try:
+                request = msgpack.packb({"observation": observation})
+                socket.send(request)
+                raw = socket.recv()
+                response = msgpack.unpackb(raw)
+                if isinstance(response, dict) and "error" in response:
+                    print(f"\nServer error: {response['error']}")
+                    time.sleep(dt)
+                    continue
+                action = response
+            except (zmq.error.Again, zmq.error.ZMQError):
+                print("\nServer timeout/connection error, reconnecting...")
+                # REQ socket must recv before next send — rebuild after timeout
+                socket.close()
+                socket = ctx.socket(zmq.REQ)
+                socket.connect(f"tcp://{server_ip}:{port}")
+                socket.setsockopt(zmq.RCVTIMEO, 5000)
+                socket.setsockopt(zmq.SNDTIMEO, 1000)
+                time.sleep(dt)
+                continue
+
+            # Process action dict from server
+            # Server sends: {"eef_9d": (1, T, 9), "joint_pos": (1, T, 6), "gripper_pos": (1, T, 1)}
+            # msgpack converts numpy → nested lists, we convert back and squeeze batch dim
+            action_dict = {
+                k: np.array(v, dtype=np.float32).squeeze(0) for k, v in action.items()
+            }
+
+            # Use a later timestep for larger movement delta.
+            # action[0] ≈ state[t+1] (~1mm), action[4] ≈ state[t+5] (~5-10mm)
+            # Use horizon-1 as the target to get meaningful movement per inference.
+            step_idx = min(action_exec_horizon - 1, action_dict["eef_9d"].shape[0] - 1)
+
+            abs_eef = action_dict["eef_9d"][step_idx]       # (9,) absolute target xyz+rot6d
+            abs_joints = action_dict["joint_pos"][step_idx]  # (6,) absolute target joint angles
+            gripper_target = float(action_dict["gripper_pos"][step_idx][0])  # absolute: 0=close, 1=open
+
+            # Compute deltas from current pose to absolute target
+            delta_xyz = abs_eef[:3] - np.array(tv[:3], dtype=np.float32)   # mm
+            # Rotation delta: compute via rotation matrices
+            if translation_only:
+                delta_rxyz = np.zeros(3, dtype=np.float32)  # no rotation change
+            else:
+                target_mat = rot6d_to_matrix(abs_eef[3:9])
+                current_mat = rxyz_to_matrix(tv[3:6])
+                delta_mat = target_mat @ current_mat.T
+                delta_rxyz = R.from_matrix(delta_mat).as_rotvec(degrees=True)
+
+            # Safety: clip deltas, then apply to current pose
+            safe_delta_xyz, safe_delta_rxyz, ok = safety.check_and_clip(
+                delta_xyz, delta_rxyz, np.array(tv[:3]),
+            )
+
+            if not ok:
+                print("\n\nSAFETY STOP! Too many violations.")
+                break
+
+            # Camera visualization (like record_demo: D455 left | D405 right)
+            if table_frame is not None and hand_frame is not None:
+                th = min(table_frame.shape[0], hand_frame.shape[0])
+                tw = min(table_frame.shape[1], hand_frame.shape[1])
+                preview = np.hstack([
+                    cv2.resize(table_frame, (tw, th)),
+                    cv2.resize(hand_frame, (tw, th)),
+                ])
+                label = (f"D455(table) | D405(hand)"
+                         f"  delta=[{safe_delta_xyz[0]:.1f} {safe_delta_xyz[1]:.1f} {safe_delta_xyz[2]:.1f}]mm"
+                         f"  grip={'CLOSE' if gripper_state < 0.5 else 'OPEN'}")
+                cv2.putText(preview, label, (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+                cv2.imshow("D455(table) | D405(hand)", preview)
+                cv2.waitKey(1)
+
+            # ServoP: EMA-smoothed absolute target to reduce diffusion noise jitter
+            alpha = 0.6  # higher = faster tracking, lower = smoother
+            new_target = np.array([abs_eef[0], abs_eef[1], abs_eef[2]], dtype=np.float32)
+            if ema_target is None:
+                ema_target = new_target.copy()
+            else:
+                ema_target = alpha * new_target + (1 - alpha) * ema_target
+
+            if not dry_run:
+                target_x, target_y, target_z = ema_target[0], ema_target[1], ema_target[2]
+                # Safety: only enforce workspace limits (not delta limits)
+                if not safety.check_workspace(np.array([target_x, target_y, target_z])):
+                    print("\n\nSAFETY: model target outside workspace!")
+                    break
+                if translation_only:
+                    conn.servop(target_x, target_y, target_z, tv[3], tv[4], tv[5])
+                else:
+                    target_mat = rot6d_to_matrix(abs_eef[3:9])
+                    target_rxyz = R.from_matrix(target_mat).as_rotvec(degrees=True)
+                    conn.servop(target_x, target_y, target_z,
+                                float(target_rxyz[0]), float(target_rxyz[1]), float(target_rxyz[2]))
+
+            # Gripper
+            if not dry_run and abs(gripper_target - gripper_state) > 0.5:
+                if gripper_target < 0.5 and hand:
+                    hand.grasp(grasp_pose, "grasp")
+                elif gripper_target > 0.5 and hand:
+                    hand.grasp(grasp_pose, "pre_grasp")
+                gripper_state = gripper_target
+
+            # Maintain Hz
+            elapsed = time.monotonic() - loop_start
+            if elapsed < dt:
+                time.sleep(dt - elapsed)
+
+    except KeyboardInterrupt:
+        print("\n\nStopping...")
+
+    # Cleanup
+    if not dry_run:
+        conn.dashboard_cmd("ResetRobot()")
+    conn.close()
+    if hand:
+        hand.close()
+    if isinstance(table_cam, RealSenseCamera):
+        table_cam.close()
+    if isinstance(hand_cam, RealSenseCamera):
+        hand_cam.close()
+    socket.close()
+    ctx.term()
+    print("Done.")
+
+
 # ─── Safety ───────────────────────────────────────────────────────────────────
 
 class SafetyChecker:
-    """Multi-layer safety limits to guard against erratic policy outputs.
+    """Clip per-step deltas and enforce workspace limits.
 
-    Layers (applied in order):
-    1. NaN/inf detection → emergency stop
-    2. Per-step delta clipping → translation + rotation independently
-    3. Workspace bounding box → hard xyz limits
-    4. Consecutive violation counter → auto-stop if too many in a row
+    Works entirely on deltas (delta_xyz_mm, delta_rxyz_deg) to avoid
+    confusion between absolute positions and incremental movements.
     """
 
     def __init__(
         self,
-        max_translation_delta: float = 30.0,   # mm per step (8Hz → 240mm/s max)
-        max_rotation_delta: float = 10.0,       # deg per step
-        workspace_min_xyz: tuple = (-200.0, -400.0, 0.0),   # mm
-        workspace_max_xyz: tuple = (400.0, 200.0, 600.0),   # mm
-        max_consecutive_violations: int = 3,
+        max_translation_delta: float = 10.0,   # mm per step
+        max_rotation_delta: float = 5.0,        # deg per step
+        workspace_min_xyz: tuple = (200.0, -400.0, 0.0),
+        workspace_max_xyz: tuple = (800.0, 200.0, 600.0),
+        max_consecutive_violations: int = 10,
     ):
         self.max_translation_delta = max_translation_delta
         self.max_rotation_delta = max_rotation_delta
@@ -317,67 +674,57 @@ class SafetyChecker:
         self.workspace_max = np.array(workspace_max_xyz, dtype=np.float32)
         self.max_consecutive_violations = max_consecutive_violations
         self.violation_count = 0
-        self.last_target = None
 
-    def check_numerics(self, action: dict) -> bool:
-        """Return True if any NaN or inf detected in action arrays."""
-        for key, arr in action.items():
-            if arr is None:
-                return True
-            a = np.asarray(arr)
-            if np.any(np.isnan(a)) or np.any(np.isinf(a)):
-                return True
-        return False
+    def check_numerics(self, arr: np.ndarray) -> bool:
+        """Return True if NaN or inf detected."""
+        return np.any(np.isnan(arr)) or np.any(np.isinf(arr))
 
-    def clip_delta(self, target_xyz_rxyz: list, current_pose: list) -> list:
-        """Clip per-step translation and rotation deltas independently."""
-        target = np.array(target_xyz_rxyz, dtype=np.float32)
-        current = np.array(current_pose, dtype=np.float32)
-
-        # Translation delta
-        trans_delta = target[:3] - current[:3]
-        trans_norm = np.linalg.norm(trans_delta)
+    def clip_delta(
+        self, delta_xyz: np.ndarray, delta_rxyz: np.ndarray
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Clip translation and rotation deltas independently."""
+        # Translation: clip magnitude
+        trans_norm = np.linalg.norm(delta_xyz)
         if trans_norm > self.max_translation_delta:
-            trans_delta = trans_delta / trans_norm * self.max_translation_delta
+            delta_xyz = delta_xyz / trans_norm * self.max_translation_delta
+        # Rotation: clip per-axis
+        delta_rxyz = np.clip(delta_rxyz, -self.max_rotation_delta, self.max_rotation_delta)
+        return delta_xyz, delta_rxyz
 
-        # Rotation delta (per-axis)
-        rot_delta = target[3:6] - current[3:6]
-        rot_delta = np.clip(rot_delta, -self.max_rotation_delta, self.max_rotation_delta)
-
-        clipped = np.concatenate([current[:3] + trans_delta, current[3:6] + rot_delta])
-        return clipped.tolist()
-
-    def enforce_workspace(self, target_xyz_rxyz: list) -> list:
-        """Hard-clamp xyz to the workspace bounding box."""
-        result = list(target_xyz_rxyz)
-        result[0] = max(self.workspace_min[0], min(self.workspace_max[0], result[0]))
-        result[1] = max(self.workspace_min[1], min(self.workspace_max[1], result[1]))
-        result[2] = max(self.workspace_min[2], min(self.workspace_max[2], result[2]))
-        return result
+    def check_workspace(self, target_xyz: np.ndarray) -> bool:
+        """Return True if target xyz is within workspace."""
+        return np.all(target_xyz >= self.workspace_min) and \
+               np.all(target_xyz <= self.workspace_max)
 
     def check_and_clip(
-        self, target_xyz_rxyz: list, current_pose: list
-    ) -> tuple[list, bool]:
-        """Apply all safety layers. Returns (safe_target, emergency_stop).
-        - emergency_stop=True: target is safe, proceed
-        - emergency_stop=False: too many consecutive violations, stop now
+        self,
+        delta_xyz: np.ndarray,
+        delta_rxyz: np.ndarray,
+        current_xyz: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray, bool]:
+        """Apply all safety layers. Returns (clipped_delta_xyz, clipped_delta_rxyz, ok).
+        ok=False means too many consecutive violations → emergency stop.
         """
-        # Layer 2: delta clipping
-        target = self.clip_delta(target_xyz_rxyz, current_pose)
-
-        # Layer 3: workspace hard limit
-        target = self.enforce_workspace(target)
-
-        # Track violations
-        was_clipped = not np.allclose(target, target_xyz_rxyz, rtol=1e-4)
-        if was_clipped:
+        if self.check_numerics(delta_xyz) or self.check_numerics(delta_rxyz):
             self.violation_count += 1
-            if self.violation_count >= self.max_consecutive_violations:
-                return target, False
+            return delta_xyz * 0, delta_rxyz * 0, False
+
+        delta_xyz, delta_rxyz = self.clip_delta(delta_xyz, delta_rxyz)
+
+        # Workspace: check if current + delta is within bounds
+        target_xyz = current_xyz + delta_xyz
+        if not self.check_workspace(target_xyz):
+            # Clamp delta so target stays in workspace
+            clamped = np.clip(target_xyz, self.workspace_min, self.workspace_max)
+            delta_xyz = clamped - current_xyz
+            self.violation_count += 1
         else:
             self.violation_count = 0
 
-        return target, True
+        if self.violation_count >= self.max_consecutive_violations:
+            return delta_xyz, delta_rxyz, False
+
+        return delta_xyz, delta_rxyz, True
 
 
 # ─── Direct Inference (no client/server) ─────────────────────────────────────
@@ -409,36 +756,73 @@ def main():
                         help="Run as inference server on training machine")
     parser.add_argument("--client", action="store_true",
                         help="Run as client sending observations to server")
+    parser.add_argument("--modality-config-path",
+                        default="examples/CR5AF/cr5af_config.py",
+                        help="Path to custom modality config for NEW_EMBODIMENT")
     parser.add_argument("--server-ip", default="192.168.16.158")
     parser.add_argument("--port", type=int, default=5555)
-    parser.add_argument("--model-path", required=True,
-                        help="Path to fine-tuned model checkpoint")
+    parser.add_argument("--model-path", default="",
+                        help="Path to fine-tuned model checkpoint (required for server/direct)")
     parser.add_argument("--robot-ip", default="192.168.5.1")
-    parser.add_argument("--task", required=True,
-                        help="Task description for the policy")
-    parser.add_argument("--grasp-pose", required=True,
-                        choices=["grasp_shaft", "grasp_housing"])
+    parser.add_argument("--task", default="",
+                        help="Task description for the policy (required for client/direct)")
+    parser.add_argument("--grasp-pose", default="",
+                        choices=["grasp_shaft", "grasp_housing"],
+                        help="Grasp pose name (required for client/direct)")
+    parser.add_argument("--translation-only", action="store_true",
+                        help="Only use xyz from model output, keep rotation fixed")
     parser.add_argument("--tophand-bin",
                         default="/home/tophand/workspaces/tophand_sdk/build/tophand")
+    parser.add_argument("--tophand-hand", default="left", choices=["left", "right"],
+                        help="TopHand hand side")
+    parser.add_argument("--hand-exposure", type=int, default=0,
+                        help="D405 hand camera exposure (0=auto)")
+    parser.add_argument("--hand-gain", type=int, default=0,
+                        help="D405 hand camera gain (0=default)")
+    parser.add_argument("--table-exposure", type=int, default=0,
+                        help="D455 table camera exposure (0=auto)")
+    parser.add_argument("--table-gain", type=int, default=0,
+                        help="D455 table camera gain (0=default)")
     parser.add_argument("--hz", type=float, default=8.0,
                         help="Control rate (Hz)")
     parser.add_argument("--action-exec-horizon", type=int, default=5,
                         help="Number of action steps to execute before re-inferring")
     parser.add_argument("--speed", type=float, default=50.0)
     parser.add_argument("--device", default="cuda:0")
-    parser.add_argument("--max-translation-delta", type=float, default=30.0,
-                        help="Max EEF translation per step in mm (8Hz: 30mm→240mm/s)")
-    parser.add_argument("--max-rotation-delta", type=float, default=10.0,
+    parser.add_argument("--dry-run", action="store_true",
+                        help="Print actions without executing ServoP (for testing)")
+    parser.add_argument("--max-translation-delta", type=float, default=10.0,
+                        help="Max EEF translation per step in mm (start small!)")
+    parser.add_argument("--max-rotation-delta", type=float, default=5.0,
                         help="Max EEF rotation per step in degrees")
     args = parser.parse_args()
 
+    # Validate: model-path required for server/direct, task+grasp for non-server
+    if not args.client and not args.model_path:
+        parser.error("--model-path is required for server/direct mode")
+    if not args.server:
+        if not args.task:
+            parser.error("--task is required for client/direct mode")
+        if not args.grasp_pose:
+            parser.error("--grasp-pose is required for client/direct mode")
+
     if args.server:
-        run_server(args.model_path, args.port)
+        run_server(args.model_path, args.port,
+                   modality_config_path=args.modality_config_path)
         return
 
     if args.client:
-        print("Client mode: connect to inference server on training machine")
-        print("(Not yet implemented - use direct mode or run server on same machine)")
+        speed = min(args.speed, 100)  # SpeedFactor valid range is 0-100
+        run_client(args.server_ip, args.port, args.robot_ip,
+                   task=args.task, grasp_pose=args.grasp_pose,
+                   tophand_bin=args.tophand_bin, tophand_hand=args.tophand_hand,
+                   hand_exposure=args.hand_exposure, hand_gain=args.hand_gain,
+                   table_exposure=args.table_exposure, table_gain=args.table_gain,
+                   hz=args.hz, action_exec_horizon=args.action_exec_horizon,
+                   speed=speed, dry_run=args.dry_run,
+                   translation_only=args.translation_only,
+                   max_translation_delta=args.max_translation_delta,
+                   max_rotation_delta=args.max_rotation_delta)
         return
 
     dt = 1.0 / args.hz
@@ -586,7 +970,7 @@ def main():
                 video_history_table[-1],
             ], axis=0)
 
-            state_dict = build_state_dict(jp, tv, quat, gripper_state)
+            state_dict = build_state_dict(jp, tv, gripper_state)
 
             observation = {
                 "video": {

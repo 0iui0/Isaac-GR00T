@@ -304,9 +304,9 @@ class TopHandCLI:
 # ─── State Conversion ────────────────────────────────────────────────────────
 
 
-def quat_to_rot6d(q):
-    """Convert quaternion [x, y, z, w] to rotation_6d (first two columns of rotation matrix)."""
-    r = R.from_quat(q)  # scipy expects [x, y, z, w]
+def rxyz_to_rot6d(rxyz_deg):
+    """Convert TCP axis-angle [rx, ry, rz] degrees → rotation_6d (first two columns of rotation matrix)."""
+    r = R.from_rotvec(rxyz_deg, degrees=True)
     mat = r.as_matrix()
     rot6d = np.concatenate([mat[:, 0], mat[:, 1]])  # first two columns = 6 values
     return rot6d.astype(np.float32)
@@ -394,10 +394,13 @@ class HidrawSpaceMouse:
                 pass
 
 
-def build_state(joint_pos, tool_vector, quaternion, gripper_pos):
-    """Build the GR00T state vector: eef_9d(9) + joint_pos(6) + gripper_pos(1) = 16D."""
+def build_state(joint_pos, tool_vector, gripper_pos):
+    """Build the GR00T state vector: eef_9d(9) + joint_pos(6) + gripper_pos(1) = 16D.
+
+    Uses TCP axis-angle directly (not RT quaternion) for consistent rotation representation.
+    """
     eef_xyz = np.array(tool_vector[:3], dtype=np.float32)       # mm
-    eef_rot6d = quat_to_rot6d(quaternion)
+    eef_rot6d = rxyz_to_rot6d(tool_vector[3:6])                 # axis-angle deg → rot6d
     eef_9d = np.concatenate([eef_xyz, eef_rot6d])              # 9D
     jp = np.array(joint_pos, dtype=np.float32)                  # 6D
     gp = np.array([gripper_pos], dtype=np.float32)              # 1D
@@ -629,7 +632,7 @@ def main():
                         print("\n[GRIPPER] OPENED")
 
             # Build state vector
-            state_vec = build_state(jp, tv, quat, gripper_state)
+            state_vec = build_state(jp, tv, gripper_state)
 
             # Left button = toggle recording on/off (edge-triggered)
             if buttons[0] and not prev_left_btn:
@@ -741,7 +744,7 @@ def main():
         images_hand_arr = np.array(ep["images_hand"], dtype=np.uint8)  # (T, 240, 320, 3)
         images_table_arr = np.array(ep["images_table"], dtype=np.uint8)
 
-        np.savez_compressed(
+        np.savez(
             ep_dir / "data.npz",
             state=state_arr,
             images_hand=images_hand_arr,
