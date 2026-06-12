@@ -124,7 +124,9 @@ def freeze_stats(acc):
     }
 
 
-def convert_dataset(input_dir: str, output_dir: str, fps: int, lookahead: int = 1):
+def convert_dataset(input_dir: str, output_dir: str, fps: int, lookahead: int = 1,
+                    reward_file: str = ""):
+    """If reward_file is given, expects a JSON mapping 'episode_NNNNNN' -> reward."""
     out = Path(output_dir)
     episodes_meta = scan_episodes(input_dir)
 
@@ -186,6 +188,8 @@ def convert_dataset(input_dir: str, output_dir: str, fps: int, lookahead: int = 
         chunk_idx = ep_idx // chunks_size
         parquet_path = out / "data" / f"chunk-{chunk_idx:03d}" / f"episode_{ep_idx:06d}.parquet"
 
+        # Read reward from meta.json (for RL post-training)
+        ep_reward = meta.get("reward", 0)
         rows = []
         for t in range(T):
             rows.append({
@@ -196,6 +200,7 @@ def convert_dataset(input_dir: str, output_dir: str, fps: int, lookahead: int = 
                 "timestamp": t / fps,
                 "task_index": task_idx,
                 "annotation.human.task_description": task_idx,
+                "reward": ep_reward,
             })
 
         df = pd.DataFrame(rows)
@@ -243,6 +248,7 @@ def convert_dataset(input_dir: str, output_dir: str, fps: int, lookahead: int = 
             "timestamp": {"dtype": "float32", "shape": []},
             "task_index": {"dtype": "int64", "shape": []},
             "annotation.human.task_description": {"dtype": "int64", "shape": []},
+            "reward": {"dtype": "float32", "shape": []},
             "observation.images.hand_view": {"dtype": "video", "shape": [240, 320, 3], "names": None},
             "observation.images.table_view": {"dtype": "video", "shape": [240, 320, 3], "names": None},
         },

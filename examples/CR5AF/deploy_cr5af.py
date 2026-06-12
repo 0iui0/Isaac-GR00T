@@ -36,6 +36,7 @@ from pathlib import Path
 
 import cv2
 import numpy as np
+import torch
 from scipy.spatial.transform import Rotation as R
 
 
@@ -321,6 +322,25 @@ def run_server(model_path: str, port: int, modality_config_path: str = ""):
     )
     print("Model loaded.")
 
+    # Load QGF IQL critic for value-guided inference (if available)
+    qgf_critic = None
+    qgf_cfg = {"guidance_weight": 0.5, "obs_dim": 16, "act_dim": 16}
+    qgf_critic_path = os.path.join(model_path.rstrip("/"), "qgf_critic.pt")
+    if os.path.exists(qgf_critic_path):
+        try:
+            sys.path.insert(0, os.path.dirname(__file__))
+            from train_iql_critic import Critic
+            qgf_critic = Critic(obs_dim=16, act_dim=16)
+            qgf_critic.load_state_dict(torch.load(qgf_critic_path, map_location="cuda:0"))
+            qgf_critic = qgf_critic.to("cuda:0")
+            qgf_critic.eval()
+            print(f"QGF critic loaded from {qgf_critic_path}")
+        except Exception as e:
+            print(f"QGF critic load failed: {e}")
+            qgf_critic = None
+    else:
+        print(f"No QGF critic found at {qgf_critic_path}")
+
     # Load TensorRT engines for acceleration (if available)
     trt_engine_path = os.path.join(model_path.rstrip("/"), "trt_engines", "engines")
     if os.path.isdir(trt_engine_path) and any(f.endswith(".engine") for f in os.listdir(trt_engine_path)):
@@ -363,6 +383,41 @@ def run_server(model_path: str, port: int, modality_config_path: str = ""):
             for k in actions[0]:
                 stacked = np.stack([a[k] for a in actions], axis=0)
                 action[k] = stacked.mean(axis=0)
+            # QGF guidance: adjust action with critic gradient
+            if qgf_critic is not None:
+                try:
+                    # Build 16D state vector from observation
+                    s = np.concatenate([
+                        obs["state"]["eef_9d"][0, 0, :9],      # (9,)
+                        obs["state"]["joint_pos"][0, 0, :6],    # (6,)
+                        obs["state"]["gripper_pos"][0, 0, :1],  # (1,)
+                    ], axis=0).astype(np.float32)  # (16,)
+                    # Build 16D action vector from prediction (first timestep)
+                    a = np.concatenate([
+                        action["eef_9d"][0, 0, :9],     # (9,)
+                        action["joint_pos"][0, 0, :6],   # (6,)
+                        action["gripper_pos"][0, 0, :1],  # (1,)
+                    ], axis=0).astype(np.float32)  # (16,)
+                    # Compute Q-gradient via torch autograd
+                    s_t = torch.from_numpy(s).unsqueeze(0).to("cuda:0")
+                    a_t = torch.from_numpy(a).unsqueeze(0).to("cuda:0")
+                    a_t.requires_grad_(True)
+                    q_val = qgf_critic(s_t, a_t)
+                    q_val.backward()
+                    with torch.no_grad():
+                        grad = a_t.grad[0].cpu().numpy()  # ∇Q(s, a) (16,)
+                        # Apply guidance: a' = a + λ * ∇Q
+                        guidance_lambda = 0.1
+                        a_guided = a + guidance_lambda * grad
+                        # Update action dict with guided values (first timestep)
+                        action["eef_9d"][0, 0, :9] = a_guided[:9]
+                        action["joint_pos"][0, 0, :6] = a_guided[9:15]
+                        action["gripper_pos"][0, 0, :1] = a_guided[15:16]
+                        print(f"  [QGF] Q={q_val.item():.3f} |∇Q|={np.linalg.norm(grad):.2f} "
+                              f"Δxyz=[{grad[0]:.2f} {grad[1]:.2f} {grad[2]:.2f}]mm", flush=True)
+                except Exception as e:
+                    print(f"  [QGF ERROR] {e}", flush=True)
+
             dt_infer = time.monotonic() - t0
             # Debug: print all timesteps for eef_9d to check trajectory
             print(f"  [infer {dt_infer*1000:.0f}ms, {num_samples} samples]", flush=True)
@@ -420,6 +475,8 @@ def run_client(server_ip: str, port: int, robot_ip: str,
     conn = CR5AFConnection(robot_ip)
     conn.connect()
     if not dry_run:
+        conn.dashboard_cmd("ClearError()")
+        time.sleep(0.3)
         print("  EnableRobot:", conn.dashboard_cmd("EnableRobot()"))
         print("  SpeedFactor:", conn.dashboard_cmd(f"SpeedFactor({int(speed)})"))
         conn.dashboard_cmd("ResetRobot()")
@@ -872,6 +929,8 @@ def main():
     print("\n[2/5] Connecting to CR5AF...")
     conn = CR5AFConnection(args.robot_ip)
     conn.connect()
+    conn.dashboard_cmd("ClearError()")
+    time.sleep(0.3)
     print("  EnableRobot:", conn.dashboard_cmd("EnableRobot()"))
     print("  SpeedFactor:", conn.dashboard_cmd(f"SpeedFactor({int(args.speed)})"))
     conn.dashboard_cmd("ResetRobot()")
