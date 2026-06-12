@@ -188,6 +188,29 @@ def compute_actions(states, lookahead=50):
 - Loss: 0.621 | 结果: 能跟踪目标，精度 ~5mm
 - **最佳方案** ✅ 但精度还不够任务要求
 
+## Current Pipeline Status
+
+```
+数据采集 → 转换 → GR00T训练(V5) → TRT部署 → 推理优化 → QGF Critic
+ 133eps     ✅         ✅           350ms      ✅       已训练但受数据分布限制
+```
+
+### IQL Critic (QGF)
+- 已完成 100k 步训练，Q(s,a) 收敛至 [0, 1] 区间
+- 成功数据 Q≈0.8，失败数据 Q≈0.0 — 区分清晰 ✅
+- 但推理时 GR00T 预测的 (s, a) 偏离训练分布 → Critic 输出 flat（Q≈0, ∇Q≈0）
+- **根因**: Frozen VLM backbone 精度不够 → (s, a) 分布漂移 → Critic 无法泛化
+
+### Pipeline 瓶颈
+```
+数据量 (133 eps) → GR00T 精度 (~5mm) → QGF 引导
+     还不够 ←──────────── 精度不够 ←──── 无法工作
+```
+
+所有环节受同一瓶颈制约：**数据量和 backbone 可训练参数**。
+- Frozen VLM + 133 eps → 精度 ~5mm（不够可靠抓取）
+- 需 300-500+ eps 或 A100 80GB 开 `--tune-llm`
+
 ---
 
 ## Files
@@ -201,6 +224,7 @@ def compute_actions(states, lookahead=50):
 | `finetune_tune_visual.sh` | Training v3 |
 | `finetune_tune_llm.sh` | Training v4 |
 | `finetune_l50.sh` | Training v5 (recommended) |
+| `train_iql_critic.py` | IQL Critic + Value training for QGF RL post-training |
 | `preview_episode.py` | Episode viewer |
 | `README.md` | This file |
 
@@ -212,3 +236,6 @@ def compute_actions(states, lookahead=50):
 | v3 | `/tmp/cr5af_finetune_v3/grasp-housing-v3-tunevisual` | 9GB |
 | v4 | `/tmp/cr5af_finetune_v4/grasp-housing-v4-tunellm` | 9GB |
 | v5 | `/tmp/cr5af_finetune_v5/grasp-housing-v5-l50` | 9GB |
+| IQL Critic | `/tmp/cr5af_iql_critic/critic.pt` + `value.pt` | 1MB |
+| RL Dataset | `/datasets/cr5af_grasp_housing_qgf.npz` | 100MB |
+| RL Data (LeRobot) | `/datasets/cr5af_grasp_housing_l50_rl` | 135GB |
