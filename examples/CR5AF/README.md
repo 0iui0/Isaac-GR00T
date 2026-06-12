@@ -184,32 +184,62 @@ def compute_actions(states, lookahead=50):
 - Loss: 0.054 | 结果: =v3 无明显改善
 - 教训: 2 层 LLM 不够，RNN 瓶颈在视觉编码
 
-### v5 (103 episodes, tune-visual + top2 LLM, lookahead=50)
+### v5 (103 eps success + 30 fail, tune-visual + top2 LLM, lookahead=50)
 - Loss: 0.621 | 结果: 能跟踪目标，精度 ~5mm
 - **最佳方案** ✅ 但精度还不够任务要求
 
-## Current Pipeline Status
+### v6 (109 eps success only, tune-visual + top2 LLM, lookahead=50)
+- 仅使用成功数据训练（VLA=BC，失败数据不可用于行为克隆）
+- 正在训练中... 🔄
 
+### IQL Critic v2 (174 eps, 100k steps)
+- Q(s,a) 范围: [-0.05, 1.08] — 成功/失败区分清晰 ✅
+- 失败数据: 仅用于 Critic + Success Classifier，不用于 GR00T ✅
+- **瓶颈**: 推理时 GR00T 的 (s, a) 偏离训练分布 → Critic 输出 flat
+
+---
+
+## Pipeline 数据闭环计划
+
+### 当前状态 (v6)
 ```
-数据采集 → 转换 → GR00T训练(V5) → TRT部署 → 推理优化 → QGF Critic
- 133eps     ✅         ✅           350ms      ✅       已训练但受数据分布限制
+数据 → GR00T BC 训练 → 部署推理 → 成功轨迹回流GR00T → 持续改进
+       仅成功数据      实时控制     +失败数据→QGF Critic
+                                   +Classifier自动化标注
 ```
 
-### IQL Critic (QGF)
-- 已完成 100k 步训练，Q(s,a) 收敛至 [0, 1] 区间
-- 成功数据 Q≈0.8，失败数据 Q≈0.0 — 区分清晰 ✅
-- 但推理时 GR00T 预测的 (s, a) 偏离训练分布 → Critic 输出 flat（Q≈0, ∇Q≈0）
-- **根因**: Frozen VLM backbone 精度不够 → (s, a) 分布漂移 → Critic 无法泛化
+### Success Classifier (下一步)
+训练一个轻量 CNN，输入 D405/D455 图像，输出 success/fail 概率:
+- 部署时自动标注 reward，无需人工按 F 键
+- 参考 hil-serl 的成功检测方案
+- 训练数据: 现有 174 eps + 部署中新增
 
-### Pipeline 瓶颈
+### 人类接管检测 (Human Takeover Detection)
+部署时检测"SpaceMouse 激活 + ServoP 停止"= 人类接管:
+- 接管前 N 步标记为 fail → 加入 Critic 训练
+- 接管后的操作 → 成功则加入 GR00T 训练（分布外探索）
+- 实现数据自动回流闭环
+
+### 数据闭环流程
 ```
-数据量 (133 eps) → GR00T 精度 (~5mm) → QGF 引导
-     还不够 ←──────────── 精度不够 ←──── 无法工作
+GR00T 部署
+  → 成功轨迹 → 加入GR00T训练集 → 重训GR00T (BC) ✅
+  → 失败轨迹 → QGF Critic + Success Classifier ✅
+  → 人类接管 → 接管前→Critic / 接管后→GR00T ✅
+  → 自动标注 → Success Classifier 替代人工按键
 ```
 
-所有环节受同一瓶颈制约：**数据量和 backbone 可训练参数**。
-- Frozen VLM + 133 eps → 精度 ~5mm（不够可靠抓取）
-- 需 300-500+ eps 或 A100 80GB 开 `--tune-llm`
+### 6维力觉集成 (规划中)
+CR5AF RT 数据 (offset 1304) 包含 6 维力传感器，可扩展 state 到 22D:
+- 接触检测: 力值突变 → 判断是否接触
+- 对齐纠正: x/y 侧向力 → 判断是否对中
+- 插入深度: Z方向力变化 → 判断插到位
+- 密集 reward: 力值变化作为 QGF 的连续 reward（比 0/1 更高效）
+
+### 多任务扩展 (规划中)
+GR00T N1.7 通过 language conditioning 区分任务，共享 VLM backbone:
+- 单模型支持多个接触型任务
+- 需要当前任务精度达标后再扩展
 
 ---
 
