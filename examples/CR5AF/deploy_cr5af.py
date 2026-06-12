@@ -559,6 +559,16 @@ def run_client(server_ip: str, port: int, robot_ip: str,
     action_buffer = np.zeros((0, 16), dtype=np.float32)
     action_step = 0
 
+    # Data collection for classifier + QGF data回流
+    dc_history = deque(maxlen=300)  # ring buffer: (state_16d, action_16d, reward, img_hand, img_table)
+    dc_episode_data = []  # current episode buffer for saving
+    dc_save_dir = os.path.join(os.path.expanduser("~"), "cr5af", "auto_collect")
+    dc_fail_steps_before_takeover = 30  # steps before takeover to mark as fail
+    dc_takeover_detected = False
+    dc_takeover_countdown = 0
+    dc_prev_tv = None  # for detecting human intervention
+    dc_servo_active = False  # True when GR00T is controlling
+
     try:
         while True:
             loop_start = time.monotonic()
@@ -713,6 +723,57 @@ def run_client(server_ip: str, port: int, robot_ip: str,
                 elif gripper_target > 0.5 and hand:
                     hand.grasp(grasp_pose, "pre_grasp")
                 gripper_state = gripper_target
+
+            # ── Data collection for classifier + QGF data回流 ──
+            if not dry_run:
+                # Build 16D state and action
+                dc_s = np.concatenate([
+                    np.array(tv[:3], dtype=np.float32),  # xyz
+                    eef_rot6d,                          # rot6d
+                    np.array(jp, dtype=np.float32),     # joints
+                    np.array([gripper_state], dtype=np.float32),  # gripper
+                ])
+                dc_a = np.concatenate([
+                    abs_eef,                             # target xyz+rot6d
+                    joint_delta,                         # joint delta
+                    np.array([gripper_target], dtype=np.float32),  # gripper target
+                ])
+                dc_history.append({
+                    "state": dc_s.copy(),
+                    "action": dc_a.copy(),
+                    "image_hand": hand_frame.copy() if hand_frame is not None else None,
+                    "image_table": table_frame.copy() if table_frame is not None else None,
+                    "timestamp": time.time(),
+                })
+
+                # Human takeover detection: if GR00T was controlling but robot moves
+                # differently than commanded, a human may have intervened
+                if dc_prev_tv is not None:
+                    actual_delta = np.linalg.norm(np.array(tv[:3]) - np.array(dc_prev_tv[:3]))
+                    # If GR00T not sending ServoP but robot is moving -> human takeover
+                    if not dc_servo_active and actual_delta > 2.0 and not dc_takeover_detected:
+                        dc_takeover_detected = True
+                        dc_takeover_countdown = dc_fail_steps_before_takeover
+                        print("\n[HUMAN TAKEOVER DETECTED]", flush=True)
+                dc_servo_active = True
+                dc_prev_tv = tv
+
+                # If takeover was detected, mark past N steps as fail and save
+                if dc_takeover_detected:
+                    dc_takeover_countdown -= 1
+                    if dc_takeover_countdown <= 0:
+                        # Save takeover segment as failure data
+                        os.makedirs(dc_save_dir, exist_ok=True)
+                        takeover_ep = f"takeover_{int(time.time())}"
+                        np.savez(os.path.join(dc_save_dir, f"{takeover_ep}.npz"),
+                                 states=np.array([d["state"] for d in dc_history]),
+                                 actions=np.array([d["action"] for d in dc_history]),
+                                 reward=np.zeros(len(dc_history), dtype=np.float32),
+                        )
+                        with open(os.path.join(dc_save_dir, f"{takeover_ep}_meta.json"), "w") as f:
+                            json.dump({"result": "fail", "source": "human_takeover"}, f)
+                        print(f"\n[DATA SAVED] takeover episode to {dc_save_dir}/{takeover_ep}", flush=True)
+                        dc_takeover_detected = False
 
             # Maintain Hz
             elapsed = time.monotonic() - loop_start
