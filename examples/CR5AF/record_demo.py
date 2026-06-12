@@ -561,6 +561,7 @@ def main():
     # ── Recording State Machine ──
     gripper_state = 1.0  # start open
     prev_left_btn = False
+    result = "success"  # press 'F' to toggle between success/fail for reward labeling
 
     episodes = []
     current_episode = None
@@ -613,7 +614,7 @@ def main():
                     cv2.resize(hand_frame, (tw, th)),
                 ])
                 ep_len = len(current_episode["state"]) if current_episode else 0
-                label = f"ep={len(episodes)} len={ep_len} grip={'CLOSE' if gripper_state < 0.5 else 'OPEN'}"
+                label = f"ep={len(episodes)} len={ep_len} grip={'CLOSE' if gripper_state < 0.5 else 'OPEN'} result={result}"
                 cv2.putText(preview, label, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
                 cv2.imshow("D455(table) | D405(hand)", preview)
                 key = cv2.waitKey(1) & 0xFF
@@ -630,6 +631,10 @@ def main():
                             hand.grasp(args.grasp_pose, "pre_grasp")
                         gripper_state = 1.0
                         print("\n[GRIPPER] OPENED")
+                if key == ord("f"):
+                    result = "fail" if result == "success" else "success"
+                    color = (0, 0, 255) if result == "fail" else (0, 255, 0)
+                    print(f"\n[RESULT] {result}", flush=True)
 
             # Build state vector
             state_vec = build_state(jp, tv, gripper_state)
@@ -644,6 +649,7 @@ def main():
                         "images_table": [],
                         "timestamps": [],
                         "gripper_states": [],
+                        "result": result,
                     }
                 else:
                     print(f"\n[EPISODE {len(episodes)}] stopped ({len(current_episode['state'])} frames)")
@@ -759,6 +765,7 @@ def main():
                 "grasp_pose": args.grasp_pose,
                 "num_frames": len(ep["state"]),
                 "hz": args.hz,
+                "result": ep.get("result", "success"),
             }, f, indent=2)
 
         print(f"  episode_{i:06d}: {len(ep['state'])} frames, "
